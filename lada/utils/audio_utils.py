@@ -7,7 +7,6 @@ import av
 import io
 import os
 import subprocess
-import shutil
 from typing import Optional
 from lada.utils import video_utils, os_utils, media_utils
 
@@ -17,9 +16,9 @@ def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_
     audio_codec = get_audio_codec(av_video_metadata.video_file)
     if audio_codec:
         needs_audio_reencoding = not is_output_container_compatible_with_input_audio_codec(audio_codec, av_video_output_path)
-        needs_video_delay = av_video_metadata.start_pts > 0
+        needs_video_delay = (av_video_metadata.start_pts or 0) > 0
 
-        cmd = ["ffmpeg", "-y", "-loglevel", "quiet"]
+        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
         cmd += ["-i", av_video_metadata.video_file]
         if needs_video_delay > 0:
             delay_in_seconds = float(av_video_metadata.start_pts * av_video_metadata.time_base)
@@ -32,10 +31,14 @@ def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_
         cmd += ["-map", "1:v:0"]
         cmd += ["-map", "0:a:0"]
         cmd += [av_video_output_path]
-        subprocess.run(cmd, stdout=subprocess.PIPE, startupinfo=os_utils.get_subprocess_startup_info())
+        cmd_result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    startupinfo=os_utils.get_subprocess_startup_info())
+        if cmd_result.returncode != 0:
+            stderr = cmd_result.stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError(f"error running ffmpeg: {stderr}. Code: {cmd_result.returncode}, cmd: {cmd}")
+        os.remove(tmp_v_video_input_path)
     else:
-        shutil.copy(tmp_v_video_input_path, av_video_output_path)
-    os.remove(tmp_v_video_input_path)
+        media_utils.replace_file(tmp_v_video_input_path, av_video_output_path)
 
 def get_audio_codec(file_path: str) -> Optional[str]:
     if not media_utils.is_video_file(file_path):

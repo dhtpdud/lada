@@ -56,7 +56,7 @@ class ExportView(Gtk.Widget):
         self.stop_requested = False
         self.pause_requested = False
         self.resume_info: ResumeInformation | None = None
-        self.video_writer: video_utils.VideoWriter | None = None
+        self.video_writer: video_utils.AsyncVideoWriter | None = None
         self.progress_calculator: export_utils.ProgressCalculator | None = None
         self.temp_file_path: str | None = None
 
@@ -210,6 +210,14 @@ class ExportView(Gtk.Widget):
         else:
             # paused, so already stopped
             logger.debug("Cancelled paused export")
+            try:
+                if self.video_writer is not None:
+                    self.video_writer.abort()
+                    self.video_writer = None
+                if self.temp_file_path and os.path.exists(self.temp_file_path):
+                    os.remove(self.temp_file_path)
+            except Exception:
+                logger.warning("Failed to clean up cancelled paused export", exc_info=True)
             self.resume_info = None
             self.emit('video-export-stopped')
 
@@ -437,7 +445,8 @@ class ExportView(Gtk.Widget):
         def run_export():
             success = True
             progress_update_step_size = 100
-            self.video_writer = None
+            if not self.resume_info:
+                self.video_writer = None
             frame_restorer_options = FrameRestorerOptions(self._config.mosaic_restoration_model,
                                                           self._config.mosaic_detection_model,
                                                           video_utils.get_video_meta_data(source_file.get_path()),
@@ -461,7 +470,7 @@ class ExportView(Gtk.Widget):
                     start_frame_num = 0
                     if not is_image_file:
                         preset = utils.get_selected_preset(self.config)
-                        self.video_writer = video_utils.VideoWriter(
+                        self.video_writer = video_utils.AsyncVideoWriter(
                             tmp_file_output_path, video_metadata.video_width,
                             video_metadata.video_height, video_metadata.video_fps_exact,
                             encoder=preset.encoder_name, encoder_options=preset.encoder_options,
@@ -493,7 +502,7 @@ class ExportView(Gtk.Widget):
                     if is_image_file:
                         video_utils.write_image_file(restored_frame, tmp_file_output_path)
                     else:
-                        self.video_writer.write(restored_frame, restored_frame_pts, bgr2rgb=True)
+                        self.video_writer.write(restored_frame, restored_frame_pts, input_format='bgr24')
 
                     duration_end = time.time()
                     duration = duration_end - duration_start
@@ -514,13 +523,19 @@ class ExportView(Gtk.Widget):
                 success = False
                 handle_exception(e)
             finally:
-                if not self.pause_requested:
-                    try:
-                        if self.video_writer is not None:
+                try:
+                    if self.video_writer is not None:
+                        if self.pause_requested:
+                            self.video_writer.drain()
+                        elif success:
                             self.video_writer.release()
-                    except Exception as e:
-                        success = False
-                        handle_exception(e)
+                            self.video_writer = None
+                        else:
+                            self.video_writer.abort()
+                            self.video_writer = None
+                except Exception as e:
+                    success = False
+                    handle_exception(e)
                 frame_restorer.stop()
 
             if self.pause_requested:

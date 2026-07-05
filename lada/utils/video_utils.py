@@ -6,14 +6,16 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import cache
-from typing import Callable, Iterator, Tuple, Literal
+from typing import Callable, Iterator, Tuple, Literal, Any
 from collections import deque
 import heapq
 import shlex
@@ -504,6 +506,7 @@ class VideoWriter:
         video_stream_out.options = stream_options
         self.output_container = output_container
         self.video_stream = video_stream_out
+        self._released = False
 
         # Buffers for reordering frames
         self.BUFFER_MAX_SIZE = 30
@@ -517,21 +520,24 @@ class VideoWriter:
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
+    def _mux_packets(self, packets):
+        for packet in packets:
+            self.output_container.mux(packet)
+
     def _process_buffer(self, flush_all=False):
         """Processes the buffer to encode frames."""
         if len(self.frame_queue) > (self.BUFFER_MAX_SIZE / 2) or (flush_all and self.frame_queue):
-            frame_to_encode = self.frame_queue.popleft()
+            frame_to_encode, input_format = self.frame_queue.popleft()
             pts_to_assign = heapq.heappop(self.pts_heap)
             self.pts_set.remove(pts_to_assign)
 
-            out_frame = av.VideoFrame.from_ndarray(frame_to_encode, format='rgb24')
+            frame_to_encode = np.ascontiguousarray(frame_to_encode)
+            out_frame = av.VideoFrame.from_ndarray(frame_to_encode, format=input_format)
             out_frame.pts = pts_to_assign
-            out_packet = self.video_stream.encode(out_frame)
-            if out_packet:
-                self.output_container.mux(out_packet)
+            self._mux_packets(self.video_stream.encode(out_frame))
 
 
-    def write(self, frame, frame_pts=None, bgr2rgb=False):
+    def write(self, frame, frame_pts=None, bgr2rgb=False, *, input_format='rgb24'):
         # We add the frame and its pts given by PyAV (FFmpeg) to a FIFO queue and a min heap, respectively.
         # Upon a call to write(), if the buffer is full, we pop the head of the queue and the smallest PTS and pair
         # those together. This operation is a no-op for "nicely behaved" videos, where frames and PTS are decoded
@@ -544,22 +550,23 @@ class VideoWriter:
             frame = frame.cpu().numpy()
         if bgr2rgb:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_format = 'rgb24'
 
         if frame_pts not in self.pts_set:
             heapq.heappush(self.pts_heap, frame_pts)
-            self.frame_queue.append(frame)
+            self.frame_queue.append((frame, input_format))
             self.pts_set.add(frame_pts)
 
         self._process_buffer()
 
     def release(self):
+        if self._released:
+            return
         while len(self.frame_queue) > 0:
             self._process_buffer(flush_all=True)
         # Flush the encoder
         try:
-            out_packet = self.video_stream.encode(None)
-            if out_packet:
-                self.output_container.mux(out_packet)
+            self._mux_packets(self.video_stream.encode(None))
         except:
             # TODO: For half of my test files flushing QSV encoders fail here with "Application provided invalid, non monotonically increasing dts to muxer in stream"
             # This doesn't happen with libx264 or NVENC encoders. The restored file plays fine so let's ignore it for now.
@@ -567,7 +574,138 @@ class VideoWriter:
                 logger.warning("Error on flushing QSV encoder. Ignoring...")
             else:
                 raise
-        self.output_container.close()
+        finally:
+            self.output_container.close()
+            self._released = True
+
+    def abort(self):
+        if self._released:
+            return
+        self.frame_queue.clear()
+        self.pts_heap.clear()
+        self.pts_set.clear()
+        try:
+            self.output_container.close()
+        finally:
+            self._released = True
+
+
+class AsyncVideoWriter:
+    _STOP = object()
+
+    def __init__(self, output_path, width, height, fps, encoder: str, encoder_options: str, time_base=None,
+                 mp4_fast_start=False, max_queue_size: int | None = None):
+        self.writer = VideoWriter(output_path, width, height, fps, encoder, encoder_options, time_base, mp4_fast_start)
+        frame_size = max(1, width * height * 3)
+        memory_limited_queue_size = max(1, (256 * 1024 * 1024) // frame_size)
+        requested_queue_size = max_queue_size if max_queue_size is not None else 8
+        queue_size = min(requested_queue_size, 8, memory_limited_queue_size)
+        self.queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, queue_size))
+        self.error: BaseException | None = None
+        self.error_lock = threading.Lock()
+        self.closed = False
+        self.aborted = False
+        self.thread = threading.Thread(target=self._worker, name="video encoder worker", daemon=True)
+        self.thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.release()
+        else:
+            self.abort()
+
+    def _set_error(self, error: BaseException):
+        with self.error_lock:
+            if self.error is None:
+                self.error = error
+        self._discard_pending_items()
+
+    def _raise_worker_error(self):
+        with self.error_lock:
+            error = self.error
+        if error is not None:
+            self._discard_pending_items()
+            raise RuntimeError("Video encoder worker failed") from error
+
+    def _discard_pending_items(self):
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self.queue.task_done()
+
+    def _put_stop_marker(self):
+        while True:
+            try:
+                self.queue.put(self._STOP, block=False)
+                return
+            except queue.Full:
+                self._discard_pending_items()
+
+    def _worker(self):
+        while True:
+            item = self.queue.get()
+            try:
+                if item is self._STOP:
+                    if self.aborted:
+                        self.writer.abort()
+                    else:
+                        self.writer.release()
+                    return
+                if self.aborted:
+                    continue
+                frame, frame_pts, bgr2rgb, input_format = item
+                self.writer.write(frame, frame_pts, bgr2rgb=bgr2rgb, input_format=input_format)
+            except BaseException as e:
+                self._set_error(e)
+                return
+            finally:
+                self.queue.task_done()
+
+    def write(self, frame, frame_pts=None, bgr2rgb=False, *, input_format='rgb24'):
+        if self.closed:
+            raise RuntimeError("Cannot write to a closed video writer")
+        self._raise_worker_error()
+        self.queue.put((frame, frame_pts, bgr2rgb, input_format))
+        self._raise_worker_error()
+
+    def drain(self):
+        if self.closed:
+            return
+        self._raise_worker_error()
+        self.queue.join()
+        self._raise_worker_error()
+
+    def release(self):
+        if self.closed:
+            return
+        try:
+            self.drain()
+            self._put_stop_marker()
+            self.thread.join()
+            self._raise_worker_error()
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            self.closed = True
+
+    def abort(self):
+        if self.closed:
+            return
+        self.aborted = True
+        self._discard_pending_items()
+        if self.thread.is_alive():
+            self._put_stop_marker()
+            self.thread.join()
+        else:
+            self.writer.abort()
+        self.closed = True
 
 def is_video_file(file_path):
     return media_utils.is_video_file(file_path)
